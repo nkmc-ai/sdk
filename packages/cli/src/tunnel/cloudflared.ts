@@ -1,10 +1,9 @@
-import { existsSync, mkdirSync, createWriteStream, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, createWriteStream, chmodSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, platform, arch } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
-
-const CLOUDFLARED_FALLBACK_VERSION = "2026.3.0";
+import { execSync } from "node:child_process";
 
 function getBinDir(): string {
   const base = process.env.NKMC_HOME || join(homedir(), ".nkmc");
@@ -17,31 +16,38 @@ function getBinaryName(): string {
   return platform() === "win32" ? "cloudflared.exe" : "cloudflared";
 }
 
-function getBinaryName_(): { osName: string; archName: string; ext: string } {
+/**
+ * Resolve the download URL for cloudflared.
+ * macOS uses .tgz archives, Linux/Windows use raw binaries.
+ */
+async function getDownloadInfo(): Promise<{ url: string; isTgz: boolean }> {
   const os = platform();
   const cpu = arch();
 
+  let osName: string;
+  let archName: string;
+
   if (os === "darwin") {
-    return { osName: "darwin", archName: cpu === "arm64" ? "arm64" : "amd64", ext: "" };
+    osName = "darwin";
+    archName = cpu === "arm64" ? "arm64" : "amd64";
   } else if (os === "linux") {
-    return { osName: "linux", archName: cpu === "arm64" ? "arm64" : "amd64", ext: "" };
+    osName = "linux";
+    archName = cpu === "arm64" ? "arm64" : "amd64";
   } else if (os === "win32") {
-    return { osName: "windows", archName: cpu === "x64" ? "amd64" : "386", ext: ".exe" };
+    osName = "windows";
+    archName = cpu === "x64" ? "amd64" : "386";
+  } else {
+    throw new Error(`Unsupported platform: ${os}`);
   }
-  throw new Error(`Unsupported platform: ${os}`);
-}
 
-async function getDownloadUrl(): Promise<string> {
-  const { osName, archName, ext } = getBinaryName_();
-  const filename = `cloudflared-${osName}-${archName}${ext}`;
+  const ext = os === "win32" ? ".exe" : "";
+  const isTgz = os === "darwin";
+  const filename = isTgz
+    ? `cloudflared-${osName}-${archName}.tgz`
+    : `cloudflared-${osName}-${archName}${ext}`;
 
-  // Try latest release URL (follows redirect to actual version)
-  const latestUrl = `https://github.com/cloudflare/cloudflared/releases/latest/download/${filename}`;
-  const head = await fetch(latestUrl, { method: "HEAD", redirect: "follow" });
-  if (head.ok) return latestUrl;
-
-  // Fallback to hardcoded version
-  return `https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_FALLBACK_VERSION}/${filename}`;
+  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/${filename}`;
+  return { url, isTgz };
 }
 
 export function getCloudflaredPath(): string {
@@ -56,7 +62,7 @@ export async function ensureCloudflared(): Promise<string> {
   const binPath = getCloudflaredPath();
   if (existsSync(binPath)) return binPath;
 
-  const url = await getDownloadUrl();
+  const { url, isTgz } = await getDownloadInfo();
   console.log(`Downloading cloudflared...`);
   console.log(`  From: ${url}`);
 
@@ -65,9 +71,23 @@ export async function ensureCloudflared(): Promise<string> {
     throw new Error(`Failed to download cloudflared: ${res.status}`);
   }
 
-  const readable = Readable.fromWeb(res.body as any);
-  const ws = createWriteStream(binPath);
-  await pipeline(readable, ws);
+  const binDir = getBinDir();
+
+  if (isTgz) {
+    // macOS: download .tgz, extract cloudflared binary
+    const tgzPath = join(binDir, "cloudflared.tgz");
+    const readable = Readable.fromWeb(res.body as any);
+    const ws = createWriteStream(tgzPath);
+    await pipeline(readable, ws);
+
+    execSync(`tar -xzf "${tgzPath}" -C "${binDir}" cloudflared`, { stdio: "ignore" });
+    try { unlinkSync(tgzPath); } catch {}
+  } else {
+    // Linux/Windows: direct binary download
+    const readable = Readable.fromWeb(res.body as any);
+    const ws = createWriteStream(binPath);
+    await pipeline(readable, ws);
+  }
 
   chmodSync(binPath, 0o755);
   console.log(`  Saved to: ${binPath}`);
