@@ -4,7 +4,7 @@ import { homedir, platform, arch } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 
-const CLOUDFLARED_VERSION = "2024.12.2";
+const CLOUDFLARED_FALLBACK_VERSION = "2026.3.0";
 
 function getBinDir(): string {
   const base = process.env.NKMC_HOME || join(homedir(), ".nkmc");
@@ -17,28 +17,31 @@ function getBinaryName(): string {
   return platform() === "win32" ? "cloudflared.exe" : "cloudflared";
 }
 
-function getDownloadUrl(): string {
+function getBinaryName_(): { osName: string; archName: string; ext: string } {
   const os = platform();
   const cpu = arch();
 
-  let osName: string;
-  let archName: string;
-
   if (os === "darwin") {
-    osName = "darwin";
-    archName = cpu === "arm64" ? "arm64" : "amd64";
+    return { osName: "darwin", archName: cpu === "arm64" ? "arm64" : "amd64", ext: "" };
   } else if (os === "linux") {
-    osName = "linux";
-    archName = cpu === "arm64" ? "arm64" : "amd64";
+    return { osName: "linux", archName: cpu === "arm64" ? "arm64" : "amd64", ext: "" };
   } else if (os === "win32") {
-    osName = "windows";
-    archName = cpu === "x64" ? "amd64" : "386";
-  } else {
-    throw new Error(`Unsupported platform: ${os}`);
+    return { osName: "windows", archName: cpu === "x64" ? "amd64" : "386", ext: ".exe" };
   }
+  throw new Error(`Unsupported platform: ${os}`);
+}
 
-  const ext = os === "win32" ? ".exe" : "";
-  return `https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-${osName}-${archName}${ext}`;
+async function getDownloadUrl(): Promise<string> {
+  const { osName, archName, ext } = getBinaryName_();
+  const filename = `cloudflared-${osName}-${archName}${ext}`;
+
+  // Try latest release URL (follows redirect to actual version)
+  const latestUrl = `https://github.com/cloudflare/cloudflared/releases/latest/download/${filename}`;
+  const head = await fetch(latestUrl, { method: "HEAD", redirect: "follow" });
+  if (head.ok) return latestUrl;
+
+  // Fallback to hardcoded version
+  return `https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_FALLBACK_VERSION}/${filename}`;
 }
 
 export function getCloudflaredPath(): string {
@@ -53,7 +56,7 @@ export async function ensureCloudflared(): Promise<string> {
   const binPath = getCloudflaredPath();
   if (existsSync(binPath)) return binPath;
 
-  const url = getDownloadUrl();
+  const url = await getDownloadUrl();
   console.log(`Downloading cloudflared...`);
   console.log(`  From: ${url}`);
 
