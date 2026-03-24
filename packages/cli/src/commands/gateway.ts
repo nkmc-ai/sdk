@@ -146,9 +146,29 @@ export async function runGatewayStart(opts: {
       const { createClient } = await import("../gateway/client.js");
       const client = await createClient();
 
+      // Discover local gateway's credential domains to advertise
+      let advertisedDomains: string[] = [];
+      try {
+        const adminToken = process.env.NKMC_ADMIN_TOKEN;
+        if (adminToken) {
+          const credRes = await fetch(`http://localhost:${port}/credentials`, {
+            headers: { Authorization: `Bearer ${adminToken}` },
+          });
+          if (credRes.ok) {
+            const credBody = await credRes.json() as { credentials?: { domain: string }[] };
+            advertisedDomains = (credBody.credentials ?? []).map((c: { domain: string }) => c.domain);
+          }
+        }
+      } catch {
+        // Local gateway may not have credentials endpoint — that's fine
+      }
+
       console.log("Creating Cloudflare Tunnel...");
       const { tunnelId: tid, tunnelToken, publicUrl } =
-        await client.createTunnel();
+        await client.createTunnel({
+          advertisedDomains,
+          gatewayName: process.env.NKMC_GATEWAY_NAME,
+        });
       tunnelId = tid;
 
       // Download cloudflared if needed
@@ -179,6 +199,9 @@ export async function runGatewayStart(opts: {
       );
 
       console.log(`  Public:  ${publicUrl}`);
+      if (advertisedDomains.length > 0) {
+        console.log(`  Domains: ${advertisedDomains.join(", ")}`);
+      }
     } catch (err: any) {
       console.error(`Tunnel setup failed: ${err.message}`);
       console.error("Gateway is running without tunnel. Use 'nkmc gateway stop' to stop.");

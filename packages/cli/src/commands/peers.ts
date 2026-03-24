@@ -66,6 +66,32 @@ export function registerPeerCommands(program: Command): void {
       }
     });
 
+  peers
+    .command("discover")
+    .description("Discover online gateway peers via tunnel network")
+    .option("--domain <domain>", "Filter by advertised domain")
+    .action(async (opts: { domain?: string }) => {
+      try {
+        const client = await createClient();
+        const { gateways } = await client.discoverPeers(opts.domain);
+        if (gateways.length === 0) {
+          console.log("No online gateways found.");
+          return;
+        }
+        console.log("Online gateways:");
+        for (const gw of gateways) {
+          console.log(`  ${gw.name} — ${gw.publicUrl}`);
+          if (gw.advertisedDomains.length > 0) {
+            console.log(`    Domains: ${gw.advertisedDomains.join(", ")}`);
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`Error: ${msg}`);
+        process.exit(1);
+      }
+    });
+
   // --- Lending rules ---
   const rules = program
     .command("rules")

@@ -240,7 +240,10 @@ export class GatewayClient {
 
   // --- Tunnel methods ---
 
-  async createTunnel(): Promise<{
+  async createTunnel(opts?: {
+    advertisedDomains?: string[];
+    gatewayName?: string;
+  }): Promise<{
     tunnelId: string;
     tunnelToken: string;
     publicUrl: string;
@@ -252,7 +255,10 @@ export class GatewayClient {
         Authorization: `Bearer ${this.token}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({}),
+      body: JSON.stringify({
+        advertisedDomains: opts?.advertisedDomains,
+        gatewayName: opts?.gatewayName,
+      }),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -291,6 +297,53 @@ export class GatewayClient {
     return res.json() as Promise<{
       tunnels: { id: string; name: string; publicUrl: string; status: string }[];
     }>;
+  }
+
+  async discoverPeers(domain?: string): Promise<{
+    gateways: {
+      id: string;
+      name: string;
+      publicUrl: string;
+      advertisedDomains: string[];
+    }[];
+  }> {
+    const params = domain ? `?domain=${encodeURIComponent(domain)}` : "";
+    const url = `${this.baseUrl()}/tunnels/discover${params}`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Discover peers failed ${res.status}: ${body}`);
+    }
+    return res.json() as Promise<{
+      gateways: {
+        id: string;
+        name: string;
+        publicUrl: string;
+        advertisedDomains: string[];
+      }[];
+    }>;
+  }
+
+  async tunnelHeartbeat(opts?: {
+    advertisedDomains?: string[];
+  }): Promise<void> {
+    const url = `${this.baseUrl()}/tunnels/heartbeat`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        advertisedDomains: opts?.advertisedDomains,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Tunnel heartbeat failed ${res.status}: ${body}`);
+    }
   }
 }
 
