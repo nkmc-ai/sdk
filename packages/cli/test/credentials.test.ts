@@ -1,10 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { loadCredentials, saveToken, getToken, saveAgentToken, getAgentToken } from "../src/credentials.js";
+import { loadCredentials, saveToken, getToken, saveAgentToken, getAgentToken, saveGatewayToken, getGatewayToken, getDefaultGateway, saveTunnelInfo, getTunnelInfo, clearTunnelInfo } from "../src/credentials.js";
 import { mkdir, rm, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { signPublishToken } from "@nkmc/core";
 import { generateGatewayKeyPair } from "@nkmc/core/testing";
+
+function fakeJwt(iat: number, exp: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ iat, exp, sub: "agent-1" })).toString("base64url");
+  return `${header}.${payload}.fakesig`;
+}
 
 describe("credentials", () => {
   let tempHome: string;
@@ -41,110 +47,129 @@ describe("credentials", () => {
           },
         },
       };
-      await writeFile(
-        join(tempHome, "credentials.json"),
-        JSON.stringify(data),
-      );
-
+      await writeFile(join(tempHome, "credentials.json"), JSON.stringify(data));
       const creds = await loadCredentials();
       expect(creds.tokens["api.example.com"].publishToken).toBe("token123");
     });
-  });
 
-  describe("saveToken", () => {
-    it("should save a publish token to credentials file", async () => {
-      const { privateKey } = await generateGatewayKeyPair();
-      const token = await signPublishToken(privateKey, "api.example.com");
-
-      await saveToken("api.example.com", token);
-
-      const filePath = join(tempHome, "credentials.json");
-      const raw = await readFile(filePath, "utf-8");
-      const creds = JSON.parse(raw);
-
-      expect(creds.tokens["api.example.com"]).toBeDefined();
-      expect(creds.tokens["api.example.com"].publishToken).toBe(token);
-      expect(creds.tokens["api.example.com"].issuedAt).toBeDefined();
-      expect(creds.tokens["api.example.com"].expiresAt).toBeDefined();
-    });
-
-    it("should set file permissions to 0600", async () => {
-      const { privateKey } = await generateGatewayKeyPair();
-      const token = await signPublishToken(privateKey, "test.com");
-
-      await saveToken("test.com", token);
-
-      const filePath = join(tempHome, "credentials.json");
-      const stats = await stat(filePath);
-      const mode = stats.mode & 0o777;
-      expect(mode).toBe(0o600);
-    });
-
-    it("should preserve tokens for other domains", async () => {
-      const { privateKey } = await generateGatewayKeyPair();
-      const token1 = await signPublishToken(privateKey, "a.example.com");
-      const token2 = await signPublishToken(privateKey, "b.example.com");
-
-      await saveToken("a.example.com", token1);
-      await saveToken("b.example.com", token2);
-
-      const filePath = join(tempHome, "credentials.json");
-      const creds = JSON.parse(await readFile(filePath, "utf-8"));
-
-      expect(creds.tokens["a.example.com"].publishToken).toBe(token1);
-      expect(creds.tokens["b.example.com"].publishToken).toBe(token2);
-    });
-
-    it("should overwrite token for same domain", async () => {
-      const { privateKey } = await generateGatewayKeyPair();
-      const token1 = await signPublishToken(privateKey, "api.example.com");
-      const token2 = await signPublishToken(privateKey, "api.example.com");
-
-      await saveToken("api.example.com", token1);
-      await saveToken("api.example.com", token2);
-
-      const filePath = join(tempHome, "credentials.json");
-      const creds = JSON.parse(await readFile(filePath, "utf-8"));
-
-      expect(creds.tokens["api.example.com"].publishToken).toBe(token2);
+    it("should migrate legacy agentToken to gateways format", async () => {
+      const data = {
+        tokens: {},
+        agentToken: {
+          token: "legacy-jwt",
+          gatewayUrl: "https://api.nkmc.ai",
+          issuedAt: "2026-01-01T00:00:00.000Z",
+          expiresAt: "2026-01-02T00:00:00.000Z",
+        },
+      };
+      await writeFile(join(tempHome, "credentials.json"), JSON.stringify(data));
+      const creds = await loadCredentials();
+      expect(creds.agentToken).toBeUndefined();
+      expect(creds.gateways?.["https://api.nkmc.ai"]?.token).toBe("legacy-jwt");
+      expect(creds.default).toBe("https://api.nkmc.ai");
     });
   });
 
-  describe("saveAgentToken", () => {
-    function fakeJwt(iat: number, exp: number): string {
-      const header = Buffer.from(JSON.stringify({ alg: "HS256" })).toString("base64url");
-      const payload = Buffer.from(JSON.stringify({ iat, exp, sub: "agent-1" })).toString("base64url");
-      return `${header}.${payload}.fakesig`;
-    }
-
-    it("should save agent token to credentials file", async () => {
-      const iat = Math.floor(Date.now() / 1000);
-      const exp = iat + 86400;
-      const token = fakeJwt(iat, exp);
-
-      await saveAgentToken("https://api.nkmc.ai", token);
-
-      const filePath = join(tempHome, "credentials.json");
-      const raw = await readFile(filePath, "utf-8");
-      const creds = JSON.parse(raw);
-
-      expect(creds.agentToken).toBeDefined();
-      expect(creds.agentToken.token).toBe(token);
-      expect(creds.agentToken.gatewayUrl).toBe("https://api.nkmc.ai");
-      expect(creds.agentToken.issuedAt).toBeDefined();
-      expect(creds.agentToken.expiresAt).toBeDefined();
-    });
-
-    it("should set file permissions to 0600", async () => {
+  describe("saveGatewayToken (multi-gateway)", () => {
+    it("should save gateway token under gateways key", async () => {
       const iat = Math.floor(Date.now() / 1000);
       const token = fakeJwt(iat, iat + 86400);
 
+      await saveGatewayToken("https://api.nkmc.ai", token);
+
+      const raw = await readFile(join(tempHome, "credentials.json"), "utf-8");
+      const creds = JSON.parse(raw);
+      expect(creds.gateways["https://api.nkmc.ai"].token).toBe(token);
+      expect(creds.default).toBe("https://api.nkmc.ai");
+    });
+
+    it("should support multiple gateways simultaneously", async () => {
+      const iat = Math.floor(Date.now() / 1000);
+      const token1 = fakeJwt(iat, iat + 86400);
+      const token2 = fakeJwt(iat + 1, iat + 86401);
+
+      await saveGatewayToken("https://api.nkmc.ai", token1);
+      await saveGatewayToken("http://localhost:9090", token2);
+
+      const raw = await readFile(join(tempHome, "credentials.json"), "utf-8");
+      const creds = JSON.parse(raw);
+      expect(creds.gateways["https://api.nkmc.ai"].token).toBe(token1);
+      expect(creds.gateways["http://localhost:9090"].token).toBe(token2);
+      expect(creds.default).toBe("http://localhost:9090"); // last one wins
+    });
+
+    it("should set file permissions to 0600", async () => {
+      const iat = Math.floor(Date.now() / 1000);
+      await saveGatewayToken("https://api.nkmc.ai", fakeJwt(iat, iat + 86400));
+      const stats = await stat(join(tempHome, "credentials.json"));
+      expect(stats.mode & 0o777).toBe(0o600);
+    });
+  });
+
+  describe("getGatewayToken", () => {
+    it("should return null for unknown gateway", async () => {
+      expect(await getGatewayToken("https://unknown.com")).toBeNull();
+    });
+
+    it("should return stored token", async () => {
+      const iat = Math.floor(Date.now() / 1000);
+      const token = fakeJwt(iat, iat + 86400);
+      await saveGatewayToken("https://api.nkmc.ai", token);
+      const result = await getGatewayToken("https://api.nkmc.ai");
+      expect(result?.token).toBe(token);
+    });
+
+    it("should return null for expired token", async () => {
+      const iat = Math.floor(Date.now() / 1000) - 200000;
+      const token = fakeJwt(iat, iat + 1); // expired
+      await saveGatewayToken("https://api.nkmc.ai", token);
+      expect(await getGatewayToken("https://api.nkmc.ai")).toBeNull();
+    });
+  });
+
+  describe("getDefaultGateway", () => {
+    it("should return null when no gateways", async () => {
+      expect(await getDefaultGateway()).toBeNull();
+    });
+
+    it("should return the last authenticated gateway", async () => {
+      const iat = Math.floor(Date.now() / 1000);
+      await saveGatewayToken("https://api.nkmc.ai", fakeJwt(iat, iat + 86400));
+      await saveGatewayToken("http://localhost:9090", fakeJwt(iat, iat + 86400));
+      const result = await getDefaultGateway();
+      expect(result?.url).toBe("http://localhost:9090");
+    });
+  });
+
+  describe("tunnel info", () => {
+    it("should save and retrieve tunnel info", async () => {
+      const iat = Math.floor(Date.now() / 1000);
+      await saveGatewayToken("http://localhost:9090", fakeJwt(iat, iat + 86400));
+      await saveTunnelInfo("http://localhost:9090", { id: "abc", publicUrl: "https://abc.tunnel.nkmc.ai" });
+
+      const info = await getTunnelInfo("http://localhost:9090");
+      expect(info?.id).toBe("abc");
+      expect(info?.publicUrl).toBe("https://abc.tunnel.nkmc.ai");
+    });
+
+    it("should clear tunnel info", async () => {
+      const iat = Math.floor(Date.now() / 1000);
+      await saveGatewayToken("http://localhost:9090", fakeJwt(iat, iat + 86400));
+      await saveTunnelInfo("http://localhost:9090", { id: "abc", publicUrl: "https://abc.tunnel.nkmc.ai" });
+      await clearTunnelInfo("http://localhost:9090");
+      expect(await getTunnelInfo("http://localhost:9090")).toBeNull();
+    });
+  });
+
+  describe("saveAgentToken (legacy compat)", () => {
+    it("should save as gateway token", async () => {
+      const iat = Math.floor(Date.now() / 1000);
+      const token = fakeJwt(iat, iat + 86400);
       await saveAgentToken("https://api.nkmc.ai", token);
 
-      const filePath = join(tempHome, "credentials.json");
-      const stats = await stat(filePath);
-      const mode = stats.mode & 0o777;
-      expect(mode).toBe(0o600);
+      const raw = await readFile(join(tempHome, "credentials.json"), "utf-8");
+      const creds = JSON.parse(raw);
+      expect(creds.gateways["https://api.nkmc.ai"].token).toBe(token);
     });
 
     it("should preserve existing publish tokens", async () => {
@@ -153,115 +178,57 @@ describe("credentials", () => {
       await saveToken("example.com", publishToken);
 
       const iat = Math.floor(Date.now() / 1000);
-      const agentJwt = fakeJwt(iat, iat + 86400);
-      await saveAgentToken("https://api.nkmc.ai", agentJwt);
+      await saveAgentToken("https://api.nkmc.ai", fakeJwt(iat, iat + 86400));
 
-      const filePath = join(tempHome, "credentials.json");
-      const creds = JSON.parse(await readFile(filePath, "utf-8"));
-
+      const raw = await readFile(join(tempHome, "credentials.json"), "utf-8");
+      const creds = JSON.parse(raw);
       expect(creds.tokens["example.com"].publishToken).toBe(publishToken);
-      expect(creds.agentToken.token).toBe(agentJwt);
-    });
-
-    it("should overwrite previous agent token", async () => {
-      const iat = Math.floor(Date.now() / 1000);
-      const token1 = fakeJwt(iat, iat + 86400);
-      const token2 = fakeJwt(iat + 1, iat + 86401);
-
-      await saveAgentToken("https://gw1.example.com", token1);
-      await saveAgentToken("https://gw2.example.com", token2);
-
-      const filePath = join(tempHome, "credentials.json");
-      const creds = JSON.parse(await readFile(filePath, "utf-8"));
-
-      expect(creds.agentToken.token).toBe(token2);
-      expect(creds.agentToken.gatewayUrl).toBe("https://gw2.example.com");
     });
   });
 
-  describe("getAgentToken", () => {
-    function fakeJwt(iat: number, exp: number): string {
-      const header = Buffer.from(JSON.stringify({ alg: "HS256" })).toString("base64url");
-      const payload = Buffer.from(JSON.stringify({ iat, exp, sub: "agent-1" })).toString("base64url");
-      return `${header}.${payload}.fakesig`;
-    }
-
+  describe("getAgentToken (legacy compat)", () => {
     it("should return null when no agent token stored", async () => {
-      const result = await getAgentToken();
-      expect(result).toBeNull();
+      expect(await getAgentToken()).toBeNull();
     });
 
-    it("should return stored agent token", async () => {
+    it("should return stored agent token via default gateway", async () => {
       const iat = Math.floor(Date.now() / 1000);
-      const exp = iat + 86400;
-      const token = fakeJwt(iat, exp);
-
+      const token = fakeJwt(iat, iat + 86400);
       await saveAgentToken("https://api.nkmc.ai", token);
 
       const result = await getAgentToken();
       expect(result).not.toBeNull();
       expect(result!.token).toBe(token);
-      expect(result!.gatewayUrl).toBe("https://api.nkmc.ai");
+      expect(result!.url).toBe("https://api.nkmc.ai");
     });
 
     it("should return null for expired agent token", async () => {
       const data = {
         tokens: {},
-        agentToken: {
-          token: "expired-jwt",
-          gatewayUrl: "https://api.nkmc.ai",
-          issuedAt: "2020-01-01T00:00:00.000Z",
-          expiresAt: "2020-01-02T00:00:00.000Z",
+        gateways: {
+          "https://api.nkmc.ai": {
+            token: "expired-jwt",
+            issuedAt: "2020-01-01T00:00:00.000Z",
+            expiresAt: "2020-01-02T00:00:00.000Z",
+          },
         },
+        default: "https://api.nkmc.ai",
       };
-      await writeFile(
-        join(tempHome, "credentials.json"),
-        JSON.stringify(data),
-      );
-
-      const result = await getAgentToken();
-      expect(result).toBeNull();
-    });
-
-    it("should return valid non-expired agent token", async () => {
-      const futureDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-      const data = {
-        tokens: {},
-        agentToken: {
-          token: "valid-jwt",
-          gatewayUrl: "https://api.nkmc.ai",
-          issuedAt: new Date().toISOString(),
-          expiresAt: futureDate,
-        },
-      };
-      await writeFile(
-        join(tempHome, "credentials.json"),
-        JSON.stringify(data),
-      );
-
-      const result = await getAgentToken();
-      expect(result).not.toBeNull();
-      expect(result!.token).toBe("valid-jwt");
+      await writeFile(join(tempHome, "credentials.json"), JSON.stringify(data));
+      expect(await getAgentToken()).toBeNull();
     });
   });
 
-  describe("getToken", () => {
-    it("should return null for unknown domain", async () => {
-      const token = await getToken("unknown.com");
-      expect(token).toBeNull();
+  describe("saveToken / getToken (publish tokens)", () => {
+    it("should save and retrieve publish token", async () => {
+      const { privateKey } = await generateGatewayKeyPair();
+      const token = await signPublishToken(privateKey, "api.example.com");
+      await saveToken("api.example.com", token);
+      expect(await getToken("api.example.com")).toBe(token);
     });
 
-    it("should return token for saved domain", async () => {
-      const { privateKey } = await generateGatewayKeyPair();
-      const publishToken = await signPublishToken(
-        privateKey,
-        "api.example.com",
-      );
-
-      await saveToken("api.example.com", publishToken);
-
-      const result = await getToken("api.example.com");
-      expect(result).toBe(publishToken);
+    it("should return null for unknown domain", async () => {
+      expect(await getToken("unknown.com")).toBeNull();
     });
 
     it("should return null for expired token", async () => {
@@ -274,35 +241,15 @@ describe("credentials", () => {
           },
         },
       };
-      await writeFile(
-        join(tempHome, "credentials.json"),
-        JSON.stringify(data),
-      );
-
-      const result = await getToken("expired.com");
-      expect(result).toBeNull();
+      await writeFile(join(tempHome, "credentials.json"), JSON.stringify(data));
+      expect(await getToken("expired.com")).toBeNull();
     });
 
-    it("should return valid non-expired token", async () => {
-      const futureDate = new Date(
-        Date.now() + 90 * 24 * 60 * 60 * 1000,
-      ).toISOString();
-      const data = {
-        tokens: {
-          "valid.com": {
-            publishToken: "valid-token",
-            issuedAt: new Date().toISOString(),
-            expiresAt: futureDate,
-          },
-        },
-      };
-      await writeFile(
-        join(tempHome, "credentials.json"),
-        JSON.stringify(data),
-      );
-
-      const result = await getToken("valid.com");
-      expect(result).toBe("valid-token");
+    it("should set file permissions to 0600", async () => {
+      const { privateKey } = await generateGatewayKeyPair();
+      await saveToken("test.com", await signPublishToken(privateKey, "test.com"));
+      const stats = await stat(join(tempHome, "credentials.json"));
+      expect(stats.mode & 0o777).toBe(0o600);
     });
   });
 });

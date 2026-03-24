@@ -13,10 +13,6 @@ function pidFilePath(dataDir: string): string {
   return join(dataDir, "gateway.pid");
 }
 
-function tunnelFilePath(dataDir: string): string {
-  return join(dataDir, "tunnel.json");
-}
-
 function resolveDataDir(dir?: string): string {
   return dir ?? resolve(homedir(), ".nkmc/server");
 }
@@ -36,37 +32,24 @@ export async function runGatewayStart(opts: {
   if (existsSync(pidFile)) {
     const pid = parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
     try {
-      process.kill(pid, 0); // check if alive
+      process.kill(pid, 0);
       console.error(
         `Gateway already running (PID ${pid}). Use 'nkmc gateway stop' first.`,
       );
       process.exit(1);
     } catch {
-      // Stale PID file, remove it
       unlinkSync(pidFile);
     }
   }
 
   if (opts.daemon) {
-    const args = [
-      "gateway",
-      "start",
-      "--port",
-      String(port),
-      "--data-dir",
-      dataDir,
-    ];
+    const args = ["gateway", "start", "--port", String(port), "--data-dir", dataDir];
     if (opts.tunnel) args.push("--tunnel");
 
-    // Fork a detached child running this same file in --foreground mode
     const child = fork(process.argv[1], args, {
       detached: true,
       stdio: "ignore",
-      env: {
-        ...process.env,
-        NKMC_DATA_DIR: dataDir,
-        NKMC_PORT: String(port),
-      },
+      env: { ...process.env, NKMC_DATA_DIR: dataDir, NKMC_PORT: String(port) },
     });
     child.unref();
     writeFileSync(pidFile, String(child.pid), "utf-8");
@@ -78,7 +61,7 @@ export async function runGatewayStart(opts: {
     return;
   }
 
-  // Foreground mode: try to import @nkmc/server
+  // Foreground mode: import @nkmc/server
   let startServer: (opts: any) => Promise<any>;
   let loadConfig: () => any;
   try {
@@ -92,116 +75,109 @@ export async function runGatewayStart(opts: {
     process.exit(1);
   }
 
-  // Override config with CLI options
   const config = loadConfig();
   config.port = port;
   config.dataDir = dataDir;
 
-  // Write PID file for this process
   writeFileSync(pidFile, String(process.pid), "utf-8");
-
   const handle = await startServer({ config });
 
-  // Track resources that need cleanup
+  // Track cleanup resources
   let cfProcess: ChildProcess | null = null;
   let tunnelId: string | null = null;
+  const localGatewayUrl = `http://localhost:${port}`;
 
-  // Clean up on exit
-  let cleanup = () => {
-    // Kill cloudflared if running
-    if (cfProcess) {
-      try {
-        cfProcess.kill();
-      } catch {}
-    }
-    // Delete tunnel via API (best-effort, fire-and-forget)
-    if (tunnelId) {
-      cleanupTunnelAsync(tunnelId);
-    }
-    // Remove tunnel.json
-    const tf = tunnelFilePath(dataDir);
-    try {
-      unlinkSync(tf);
-    } catch {}
-    // Remove PID file and close server
-    try {
-      unlinkSync(pidFile);
-    } catch {}
+  const cleanup = () => {
+    if (cfProcess) try { cfProcess.kill(); } catch {}
+    if (tunnelId) cleanupTunnelAsync(tunnelId);
+    try { unlinkSync(pidFile); } catch {}
     handle.close();
   };
 
-  process.on("SIGINT", () => {
-    cleanup();
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    cleanup();
-    process.exit(0);
-  });
+  process.on("SIGINT", () => { cleanup(); process.exit(0); });
+  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 
   // --- Tunnel setup ---
   if (opts.tunnel) {
     try {
-      // Use hosted gateway credentials
-      const { createClient } = await import("../gateway/client.js");
-      const client = await createClient();
+      const { createClientFor } = await import("../gateway/client.js");
+      const {
+        saveTunnelInfo,
+        clearTunnelInfo,
+        HOSTED_GATEWAY_URL,
+        saveGatewayToken,
+      } = await import("../credentials.js");
 
-      // Discover local gateway's credential domains to advertise
-      let advertisedDomains: string[] = [];
-      try {
-        const adminToken = process.env.NKMC_ADMIN_TOKEN;
-        if (adminToken) {
-          const credRes = await fetch(`http://localhost:${port}/credentials`, {
-            headers: { Authorization: `Bearer ${adminToken}` },
-          });
-          if (credRes.ok) {
-            const credBody = await credRes.json() as { credentials?: { domain: string }[] };
-            advertisedDomains = (credBody.credentials ?? []).map((c: { domain: string }) => c.domain);
-          }
-        }
-      } catch {
-        // Local gateway may not have credentials endpoint — that's fine
+      // Auto-auth with hosted gateway (user doesn't need to run nkmc auth separately)
+      console.log("Connecting to hosted gateway...");
+      const hostedClient = await createClientFor(HOSTED_GATEWAY_URL);
+
+      // Also ensure local gateway is saved in credentials
+      // (so nkmc commands default to local)
+      const localAuthRes = await fetch(`${localGatewayUrl}/auth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sub: `local-${Date.now()}`, svc: "gateway", roles: ["agent"], expiresIn: "24h" }),
+      });
+      if (localAuthRes.ok) {
+        const { token } = (await localAuthRes.json()) as { token: string };
+        await saveGatewayToken(localGatewayUrl, token);
       }
 
+      // Discover local credential domains to advertise
+      let advertisedDomains: string[] = [];
+      try {
+        const adminToken = readFileSync(join(dataDir, "admin-token"), "utf-8").trim();
+        const credRes = await fetch(`${localGatewayUrl}/credentials`, {
+          headers: { Authorization: `Bearer ${adminToken}` },
+        });
+        if (credRes.ok) {
+          const { domains } = (await credRes.json()) as { domains: string[] };
+          advertisedDomains = domains ?? [];
+        }
+      } catch {}
+
+      // Create tunnel via hosted gateway
       console.log("Creating Cloudflare Tunnel...");
       const { tunnelId: tid, tunnelToken, publicUrl } =
-        await client.createTunnel({
+        await hostedClient.createTunnel({
           advertisedDomains,
           gatewayName: process.env.NKMC_GATEWAY_NAME,
         });
       tunnelId = tid;
 
-      // Download cloudflared if needed
-      const { ensureCloudflared } = await import(
-        "../tunnel/cloudflared.js"
-      );
+      // Save tunnel info to credentials.json (under local gateway entry)
+      await saveTunnelInfo(localGatewayUrl, { id: tid, publicUrl });
+
+      // Download + run cloudflared
+      const { ensureCloudflared } = await import("../tunnel/cloudflared.js");
       const bin = await ensureCloudflared();
 
-      // Spawn cloudflared with the tunnel token
-      cfProcess = spawn(
-        bin,
-        ["tunnel", "--url", `http://localhost:${port}`, "run", "--token", tunnelToken],
-        {
-          stdio: "ignore",
-          detached: false,
-        },
-      );
+      cfProcess = spawn(bin, ["tunnel", "run", "--token", tunnelToken], {
+        stdio: "ignore",
+        detached: false,
+      });
 
       cfProcess.on("exit", (code) => {
         console.error(`cloudflared exited with code ${code}`);
         cfProcess = null;
       });
 
-      // Save tunnel info for cleanup on stop
-      writeFileSync(
-        tunnelFilePath(dataDir),
-        JSON.stringify({ tunnelId: tid, publicUrl }),
-      );
-
       console.log(`  Public:  ${publicUrl}`);
       if (advertisedDomains.length > 0) {
         console.log(`  Domains: ${advertisedDomains.join(", ")}`);
       }
+
+      // Override cleanup to also clear tunnel info
+      const origCleanup = cleanup;
+      const enhancedCleanup = () => {
+        clearTunnelInfo(localGatewayUrl).catch(() => {});
+        origCleanup();
+      };
+      process.removeAllListeners("SIGINT");
+      process.removeAllListeners("SIGTERM");
+      process.on("SIGINT", () => { enhancedCleanup(); process.exit(0); });
+      process.on("SIGTERM", () => { enhancedCleanup(); process.exit(0); });
     } catch (err: any) {
       console.error(`Tunnel setup failed: ${err.message}`);
       console.error("Gateway is running without tunnel. Use 'nkmc gateway stop' to stop.");
@@ -209,41 +185,34 @@ export async function runGatewayStart(opts: {
   }
 }
 
-/** Best-effort async tunnel deletion (used during cleanup). */
+/** Best-effort async tunnel deletion. */
 async function cleanupTunnelAsync(id: string): Promise<void> {
   try {
-    const { createClient } = await import("../gateway/client.js");
-    const client = await createClient();
+    const { createClientFor } = await import("../gateway/client.js");
+    const { HOSTED_GATEWAY_URL } = await import("../credentials.js");
+    const client = await createClientFor(HOSTED_GATEWAY_URL);
     await client.deleteTunnel(id);
-  } catch {
-    // Ignore errors during cleanup
-  }
+  } catch {}
 }
 
-export function runGatewayStop(opts: { dataDir?: string }): void {
+export async function runGatewayStop(opts: { dataDir?: string }): Promise<void> {
   const dataDir = resolveDataDir(opts.dataDir);
   const pidFile = pidFilePath(dataDir);
+  const localGatewayUrl = `http://localhost:9090`; // default
 
-  // Clean up tunnel if present
-  const tf = tunnelFilePath(dataDir);
-  if (existsSync(tf)) {
-    try {
-      const info = JSON.parse(readFileSync(tf, "utf-8"));
-      if (info.tunnelId) {
-        console.log(`Cleaning up tunnel ${info.tunnelId}...`);
-        // Fire-and-forget async cleanup
-        cleanupTunnelAsync(info.tunnelId).then(
-          () => console.log("Tunnel deleted."),
-          () => console.log("Tunnel cleanup failed (may need manual cleanup)."),
-        );
-      }
-      unlinkSync(tf);
-    } catch {
-      try {
-        unlinkSync(tf);
-      } catch {}
+  // Clean up tunnel from credentials
+  try {
+    const { getTunnelInfo, clearTunnelInfo } = await import("../credentials.js");
+    const tunnel = await getTunnelInfo(localGatewayUrl);
+    if (tunnel) {
+      console.log(`Cleaning up tunnel ${tunnel.id}...`);
+      cleanupTunnelAsync(tunnel.id).then(
+        () => console.log("Tunnel deleted."),
+        () => console.log("Tunnel cleanup failed (may need manual cleanup)."),
+      );
+      await clearTunnelInfo(localGatewayUrl);
     }
-  }
+  } catch {}
 
   if (!existsSync(pidFile)) {
     console.log("No running gateway found.");
@@ -276,16 +245,13 @@ export function runGatewayStatus(opts: { dataDir?: string }): void {
     console.log(`Gateway is running (PID ${pid})`);
     console.log(`  Data: ${dataDir}`);
 
-    // Show tunnel info if available
-    const tf = tunnelFilePath(dataDir);
-    if (existsSync(tf)) {
-      try {
-        const info = JSON.parse(readFileSync(tf, "utf-8"));
-        if (info.publicUrl) {
-          console.log(`  Tunnel: ${info.publicUrl}`);
-        }
-      } catch {}
-    }
+    // Show tunnel info from credentials
+    import("../credentials.js").then(async ({ getTunnelInfo }) => {
+      const tunnel = await getTunnelInfo(`http://localhost:9090`);
+      if (tunnel) {
+        console.log(`  Tunnel: ${tunnel.publicUrl}`);
+      }
+    }).catch(() => {});
   } catch {
     unlinkSync(pidFile);
     console.log("Gateway is not running (stale PID file cleaned up).");

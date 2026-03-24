@@ -22,40 +22,33 @@ describe("gateway PID file management", () => {
   });
 
   describe("runGatewayStop", () => {
-    it("should print 'No running gateway found.' when no PID file exists", () => {
-      runGatewayStop({ dataDir: tempDir });
-
+    it("should print 'No running gateway found.' when no PID file exists", async () => {
+      await runGatewayStop({ dataDir: tempDir });
       const output = consoleLogSpy.mock.calls.map((c) => c[0]).join("\n");
       expect(output).toContain("No running gateway found.");
     });
 
-    it("should remove stale PID file and print appropriate message", () => {
-      // Write a PID file with a PID that does not exist
+    it("should remove stale PID file and print appropriate message", async () => {
       const pidFile = join(tempDir, "gateway.pid");
       writeFileSync(pidFile, "999999999", "utf-8");
 
-      runGatewayStop({ dataDir: tempDir });
+      await runGatewayStop({ dataDir: tempDir });
 
-      // PID file should be removed
       expect(existsSync(pidFile)).toBe(false);
-
       const output = consoleLogSpy.mock.calls.map((c) => c[0]).join("\n");
       expect(output).toContain("stale PID file removed");
     });
 
-    it("should kill running process and remove PID file", () => {
-      // Use current process PID (which is definitely alive)
+    it("should kill running process and remove PID file", async () => {
       const pidFile = join(tempDir, "gateway.pid");
       writeFileSync(pidFile, String(process.pid), "utf-8");
 
-      // Mock process.kill to simulate successful kill without actually sending signal
       const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 
-      runGatewayStop({ dataDir: tempDir });
+      await runGatewayStop({ dataDir: tempDir });
 
       expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGTERM");
       expect(existsSync(pidFile)).toBe(false);
-
       const output = consoleLogSpy.mock.calls.map((c) => c[0]).join("\n");
       expect(output).toContain(`Gateway stopped (PID ${process.pid})`);
     });

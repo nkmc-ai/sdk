@@ -63,8 +63,8 @@ describe("runAuth", () => {
     const creds = JSON.parse(
       await readFile(join(tempHome, "credentials.json"), "utf-8"),
     );
-    expect(creds.agentToken.token).toBe(token);
-    expect(creds.agentToken.gatewayUrl).toBe("https://gw.test.com");
+    expect(creds.gateways["https://gw.test.com"].token).toBe(token);
+    expect(creds.default).toBe("https://gw.test.com");
   });
 
   it("should use default gateway URL when none provided", async () => {

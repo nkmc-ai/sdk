@@ -347,20 +347,49 @@ export class GatewayClient {
   }
 }
 
+/** Create a client for the default gateway (last one authenticated with). */
 export async function createClient(): Promise<GatewayClient> {
-  const { getAgentToken } = await import("../credentials.js");
-  const stored = await getAgentToken();
+  const { getDefaultGateway, HOSTED_GATEWAY_URL } = await import("../credentials.js");
 
-  const gatewayUrl =
-    process.env.NKMC_GATEWAY_URL ?? stored?.gatewayUrl ?? "https://api.nkmc.ai";
+  // Env overrides take precedence
+  if (process.env.NKMC_TOKEN) {
+    const url = process.env.NKMC_GATEWAY_URL ?? HOSTED_GATEWAY_URL;
+    return new GatewayClient(url, process.env.NKMC_TOKEN);
+  }
 
-  const token = process.env.NKMC_TOKEN ?? stored?.token ?? null;
-
-  if (!token) {
+  const stored = await getDefaultGateway();
+  if (!stored) {
     throw new Error(
       "No token found. Run 'nkmc auth' first, or set NKMC_TOKEN.",
     );
   }
 
+  return new GatewayClient(stored.url, stored.token);
+}
+
+/** Create a client for a specific gateway URL. Auto-authenticates if no token stored. */
+export async function createClientFor(gatewayUrl: string): Promise<GatewayClient> {
+  const { getGatewayToken, saveGatewayToken } = await import("../credentials.js");
+
+  // Check if we have a valid token for this gateway
+  const stored = await getGatewayToken(gatewayUrl);
+  if (stored) {
+    return new GatewayClient(gatewayUrl, stored.token);
+  }
+
+  // Auto-authenticate: get a token from the gateway
+  const sub = `agent-${Date.now()}`;
+  const res = await fetch(`${gatewayUrl.replace(/\/$/, "")}/auth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sub, svc: "gateway", roles: ["agent"], expiresIn: "24h" }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Auto-auth failed for ${gatewayUrl}: ${res.status}`);
+  }
+
+  const { token } = (await res.json()) as { token: string };
+  await saveGatewayToken(gatewayUrl, token);
   return new GatewayClient(gatewayUrl, token);
 }
