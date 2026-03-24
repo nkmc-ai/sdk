@@ -1,6 +1,6 @@
 {
   "name": "@nkmc/cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "The gateway of internet for all agents — nkmc CLI",
   "license": "MIT",
   "type": "module",
