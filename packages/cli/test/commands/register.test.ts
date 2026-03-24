@@ -192,11 +192,14 @@ describe("runRegister", () => {
     vi.restoreAllMocks();
   });
 
-  it("should throw if gatewayUrl is missing", async () => {
+  it("should default gatewayUrl to https://api.nkmc.ai when missing", async () => {
     delete process.env.NKMC_GATEWAY_URL;
+    // Without NKMC_GATEWAY_URL, runRegister defaults to https://api.nkmc.ai
+    // and proceeds (no "Gateway URL is required" error).
+    // It will fail later because skill.md doesn't exist in cwd.
     await expect(
       runRegister({ domain: "test.com", token: "t" }),
-    ).rejects.toThrow("Gateway URL is required");
+    ).rejects.toThrow("ENOENT");
   });
 
   it("should throw if domain is missing", async () => {
