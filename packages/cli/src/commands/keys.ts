@@ -1,11 +1,5 @@
 import type { Command } from "commander";
-import {
-  saveKey,
-  getKey,
-  listKeys,
-  deleteKey,
-} from "../credentials.js";
-import { getAuthHint, DOMAIN_AUTH_HINTS } from "../keys/provider-map.js";
+import { getAuthHint } from "../keys/provider-map.js";
 
 export function registerKeysCommand(program: Command): void {
   const keys = program
@@ -14,16 +8,15 @@ export function registerKeysCommand(program: Command): void {
 
   keys
     .command("set <domain>")
-    .description("Set an API key for a domain")
+    .description("Set an API key for a domain (stored encrypted in gateway vault)")
     .option("--token <value>", "API key / token value")
-    .option("--sync", "Also upload to gateway (BYOK)")
-    .action(async (domain: string, opts: { token?: string; sync?: boolean }) => {
+    .option("--local", "Store locally only (not recommended — plaintext)")
+    .action(async (domain: string, opts: { token?: string; local?: boolean }) => {
       try {
         const hint = getAuthHint(domain);
 
         let tokenValue = opts.token;
         if (!tokenValue) {
-          // Non-interactive: require --token flag
           const envHint = hint ? `(${hint.envVar})` : "";
           console.error(
             `Usage: nkmc keys set ${domain} --token <value> ${envHint}`,
@@ -34,17 +27,18 @@ export function registerKeysCommand(program: Command): void {
           process.exit(1);
         }
 
-        // Build auth object based on the hint
         const auth = buildAuth(domain, tokenValue, hint);
 
-        // Save locally
-        await saveKey(domain, auth);
-        console.log(`Key saved for ${domain}`);
-
-        // Optionally sync to gateway
-        if (opts.sync) {
-          await syncToGateway(domain, auth);
+        if (opts.local) {
+          // Legacy: store in local plaintext file (not recommended)
+          const { saveKey } = await import("../credentials.js");
+          await saveKey(domain, auth);
+          console.log(`Key saved locally for ${domain} (plaintext — consider using gateway vault instead)`);
+          return;
         }
+
+        // Default: store in gateway vault (encrypted)
+        await syncToGateway(domain, auth);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`Error: ${msg}`);
@@ -55,42 +49,41 @@ export function registerKeysCommand(program: Command): void {
   keys
     .command("list")
     .description("List all saved API keys")
-    .option("--remote", "Also list keys stored on gateway")
-    .action(async (opts: { remote?: boolean }) => {
+    .option("--local", "Also list locally stored keys")
+    .action(async (opts: { local?: boolean }) => {
       try {
-        const localKeys = await listKeys();
-        const domains = Object.keys(localKeys);
-
-        if (domains.length === 0 && !opts.remote) {
-          console.log("No keys stored. Use 'nkmc keys set <domain>' to add one.");
-          return;
-        }
-
-        if (domains.length > 0) {
-          console.log("Local keys:");
-          for (const domain of domains) {
-            const entry = localKeys[domain];
-            const maskedAuth = maskAuth(entry.auth);
-            console.log(`  ${domain}  ${maskedAuth}  (${entry.updatedAt})`);
-          }
-        }
-
-        if (opts.remote) {
-          try {
-            const { createClient } = await import("../gateway/client.js");
-            const client = await createClient();
-            const { domains: remoteDomains } = await client.listByok();
-            console.log("\nGateway BYOK keys:");
-            if (remoteDomains.length === 0) {
-              console.log("  (none)");
-            } else {
-              for (const d of remoteDomains) {
-                console.log(`  ${d}`);
-              }
+        // Always show gateway keys first
+        try {
+          const { createClient } = await import("../gateway/client.js");
+          const client = await createClient();
+          const { domains } = await client.listByok();
+          console.log("Gateway vault keys:");
+          if (domains.length === 0) {
+            console.log("  (none)");
+          } else {
+            for (const d of domains) {
+              console.log(`  ${d}`);
             }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.error(`\nCould not fetch remote keys: ${msg}`);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Could not fetch gateway keys: ${msg}`);
+          console.error("  Run 'nkmc auth' first, or start a local gateway.");
+        }
+
+        if (opts.local) {
+          const { listKeys } = await import("../credentials.js");
+          const localKeys = await listKeys();
+          const domains = Object.keys(localKeys);
+          console.log("\nLocal keys (plaintext):");
+          if (domains.length === 0) {
+            console.log("  (none)");
+          } else {
+            for (const domain of domains) {
+              const entry = localKeys[domain];
+              const maskedAuth = maskAuth(entry.auth);
+              console.log(`  ${domain}  ${maskedAuth}  (${entry.updatedAt})`);
+            }
           }
         }
       } catch (err) {
@@ -103,25 +96,25 @@ export function registerKeysCommand(program: Command): void {
   keys
     .command("remove <domain>")
     .description("Remove an API key for a domain")
-    .option("--remote", "Also remove from gateway")
-    .action(async (domain: string, opts: { remote?: boolean }) => {
+    .option("--local", "Also remove locally stored key")
+    .action(async (domain: string, opts: { local?: boolean }) => {
       try {
-        const removed = await deleteKey(domain);
-        if (removed) {
-          console.log(`Key removed for ${domain}`);
-        } else {
-          console.log(`No key found for ${domain}`);
+        // Remove from gateway vault
+        try {
+          const { createClient } = await import("../gateway/client.js");
+          const client = await createClient();
+          await client.deleteByok(domain);
+          console.log(`Key removed from gateway vault for ${domain}`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Could not remove from gateway: ${msg}`);
         }
 
-        if (opts.remote) {
-          try {
-            const { createClient } = await import("../gateway/client.js");
-            const client = await createClient();
-            await client.deleteByok(domain);
-            console.log(`Gateway BYOK key removed for ${domain}`);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.error(`Could not remove remote key: ${msg}`);
+        if (opts.local) {
+          const { deleteKey } = await import("../credentials.js");
+          const removed = await deleteKey(domain);
+          if (removed) {
+            console.log(`Local key removed for ${domain}`);
           }
         }
       } catch (err) {
@@ -160,16 +153,5 @@ async function syncToGateway(
   const { createClient } = await import("../gateway/client.js");
   const client = await createClient();
   await client.uploadByok(domain, auth);
-  console.log(`Key synced to gateway for ${domain}`);
-}
-
-/** Try to load @shipkey/core backend for additional storage */
-async function tryShipkeyBackend(): Promise<any | null> {
-  try {
-    const { getBackend } = await import("@shipkey/core");
-    const backend = getBackend();
-    return (await backend.isAvailable()) ? backend : null;
-  } catch {
-    return null;
-  }
+  console.log(`Key saved to gateway vault for ${domain}`);
 }
