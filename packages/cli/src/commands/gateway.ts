@@ -53,11 +53,24 @@ export async function runGatewayStart(opts: {
     });
     child.unref();
     writeFileSync(pidFile, String(child.pid), "utf-8");
-    console.log(`Gateway started in background (PID ${child.pid})`);
-    console.log(`  Port: ${port}`);
-    console.log(`  Data: ${dataDir}`);
-    if (opts.tunnel) console.log(`  Tunnel: enabled (connecting...)`);
-    console.log(`  Stop: nkmc gateway stop`);
+
+    // Wait a moment for the server to start, then show status
+    await new Promise((r) => setTimeout(r, 2000));
+
+    console.log();
+    console.log("  nkmc gateway is running");
+    console.log();
+    console.log(`  PID:    ${child.pid}`);
+    console.log(`  Port:   ${port}`);
+    console.log(`  Local:  http://localhost:${port}`);
+    if (opts.tunnel) console.log("  Tunnel: connecting...");
+    console.log(`  Data:   ${dataDir}`);
+    console.log();
+    console.log("  Commands:");
+    console.log("    nkmc gateway status    check status");
+    console.log("    nkmc gateway stop      stop the gateway");
+    console.log("    nkmc keys set <domain> store an API key");
+    console.log();
     return;
   }
 

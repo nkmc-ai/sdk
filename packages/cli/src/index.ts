@@ -126,12 +126,12 @@ registerPeerCommands(program);
 const gw = program.command("gateway").description("Start/stop local gateway (nkmc gateway start --tunnel)");
 
 gw.command("start")
-  .description("Start a local nkmc gateway")
+  .description("Start a local nkmc gateway (runs in background by default)")
   .option("--port <port>", "Port to listen on", "9090")
   .option("--data-dir <dir>", "Data directory")
-  .option("--daemon", "Run in background")
+  .option("--foreground", "Run in foreground instead of background")
   .option("--tunnel", "Expose gateway via Cloudflare Tunnel")
-  .action((opts) => runGatewayStart(opts));
+  .action((opts) => runGatewayStart({ ...opts, daemon: !opts.foreground }));
 
 gw.command("stop")
   .description("Stop the local nkmc gateway")
